@@ -1,0 +1,147 @@
+# --------------------------------------------------------------------
+# PyTorch 2.6.0 (from source) for ARM64 + CUDA 12.3 (Ubuntu 22.04)
+# - cuDNN support
+# - Uses system protobuf (no vendored)
+# - Disables XNNPACK/QNNPACK/NNPACK (CPU inference stacks)
+# - Forces CMake 3.22 usage and prevents pip cmake from shadowing
+# - Patches third_party/FP16 and third_party/psimd CMake mins
+# --------------------------------------------------------------------
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+RUN uname -m
+ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
+
+# Core toggles
+ENV CUDA_HOME=/usr/local/cuda
+ENV USE_CUDA=1 \
+    USE_CUDNN=1 \
+    USE_NCCL=0 \
+    USE_MKLDNN=0 \
+    BUILD_TEST=0
+# Prefer system cmake (3.22) over any pip-installed one
+ENV PATH="/usr/bin:${PATH}"
+
+# Base toolchain and libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates curl wget pkg-config \
+    build-essential g++ gcc make ccache \
+    python3 python3-dev python3-pip python3-venv \
+    cmake ninja-build \
+    libopenblas-dev libffi-dev libssl-dev \
+    libprotobuf-dev protobuf-compiler \
+    libuv1-dev zlib1g-dev libjpeg-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Ensure Kitware cmake isn't present and stay on Ubuntu 3.22
+RUN rm -f /etc/apt/sources.list.d/kitware.list || true \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends --allow-downgrades 'cmake=3.22.*' \
+ && cmake --version && which cmake
+
+# NCCL (best effort; may already be there)
+# RUN set -eux; \
+#     if dpkg -s libnccl-dev >/dev/null 2>&1 && dpkg -s libnccl2 >/dev/null 2>&1; then \
+#         echo "NCCL present, skipping install"; \
+#     else \
+#         apt-get update; \
+#         apt-get install -y --no-install-recommends --allow-change-held-packages libnccl2 libnccl-dev || true; \
+#         rm -rf /var/lib/apt/lists/*; \
+#     fi
+
+# cuDNN for CUDA 12.x on arm64
+# RUN set -eux; \
+#     apt-get update; \
+#     apt-get install -y --no-install-recommends libcudnn8 libcudnn8-dev || \
+#     apt-get install -y --no-install-recommends libcudnn-dev libcudnn || true; \
+#     if [ -f /usr/include/cudnn.h ] || [ -f /usr/local/cuda/include/cudnn.h ]; then \
+#         echo "cuDNN headers found"; \
+#     else \
+#         echo "WARNING: cuDNN headers not found - build may proceed without cuDNN"; \
+#     fi; \
+#     rm -rf /var/lib/apt/lists/*
+
+# Constraints: keep numpy, cmake, ninja in safe ranges for source builds
+ARG NUMPY_PIN=1.26.4
+RUN printf "numpy==%s\ncmake<3.30\nninja<1.12\n" "$NUMPY_PIN" > /tmp/constraints.txt
+RUN python3 -m pip install --upgrade pip wheel setuptools -c /tmp/constraints.txt
+
+# Build env flags (system protobuf, linker optimization, skip CPU inference stacks, keep logs quiet)
+ENV USE_SYSTEM_PROTOBUF=1 \
+    BUILD_CUSTOM_PROTOBUF=0 \
+    Protobuf_PROTOC_EXECUTABLE=/usr/bin/protoc \
+    USE_PRIORITIZED_TEXT_FOR_LD=1 \
+    USE_XNNPACK=0 \
+    USE_QNNPACK=0 \
+    USE_PYTORCH_QNNPACK=0 \
+    USE_NNPACK=0 \
+    USE_FBGEMM=0 \
+    USE_NUMA=0 \
+    USE_TENSORPIPE=1 \
+    USE_GLOO=0 \
+    USE_MPI=0
+
+# cuDNN hints (if needed)
+ENV CUDNN_LIBRARY=/usr/lib/aarch64-linux-gnu \
+    CUDNN_INCLUDE_DIR=/usr/include
+
+# NEW...ATTEMPT TO USE SM_120 for BLACKWELL LETS GO
+ENV TORCH_CUDA_ARCH_LIST="12.0+PTX"
+ARG MAX_JOBS=8
+ENV MAX_JOBS=${MAX_JOBS}
+
+# ---- Get & build PyTorch 2.6.0 ----
+WORKDIR /workspace
+ARG PYTORCH_REF=v2.6.0
+RUN git clone --recursive --branch ${PYTORCH_REF} https://github.com/pytorch/pytorch.git
+
+WORKDIR /workspace/pytorch
+RUN git submodule sync && git submodule update --init --recursive
+
+# Patch vendored CMake mins that can hard-fail on newer CMake
+# (Harmless on 3.22; avoids fatal if a newer cmake slips in)
+RUN sed -i '1s/.*/cmake_minimum_required(VERSION 3.5)/' third_party/FP16/CMakeLists.txt || true \
+ && sed -i '1s/.*/cmake_minimum_required(VERSION 3.5)/' third_party/psimd/CMakeLists.txt || true \
+ && sed -i '1s/.*/cmake_minimum_required(VERSION 3.5)/' third_party/tensorpipe/third_party/libuv/CMakeLists.txt || true
+
+# Install PyTorch requirements with constraints; ensure cmake is /usr/bin and 3.22
+RUN python3 -m pip install -r requirements.txt -c /tmp/constraints.txt \
+ && python3 -m pip uninstall -y cmake || true \
+ && which cmake && cmake --version
+
+# Common extras (also constrained)
+RUN python3 -m pip install \
+    typing_extensions filelock sympy networkx jinja2 fsspec \
+    -c /tmp/constraints.txt
+
+# Ensure the NumPy pin is active
+RUN python3 -m pip install "numpy==${NUMPY_PIN}" --force-reinstall
+
+# Build the wheel (double-check CMake path/version right before)
+RUN which cmake && cmake --version \
+ && python3 -m pip wheel . --no-deps -c /tmp/constraints.txt
+
+# Install the built wheel
+RUN python3 -m pip install --no-cache-dir torch-*.whl -c /tmp/constraints.txt
+
+# Don’t import torch from inside the repo dir
+WORKDIR /opt
+
+# Verification
+RUN python3 - <<'PY'
+import torch, subprocess, shlex, numpy as np
+print("Torch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("cuDNN enabled:", torch.backends.cudnn.enabled)
+print("cuDNN version:", torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else "N/A")
+try:
+    out = subprocess.check_output(shlex.split("nvcc --version")).decode()
+    print([l for l in out.splitlines() if "release" in l][0])
+except Exception as e:
+    print("nvcc check failed:", e)
+print("GPU count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("GPU 0:", torch.cuda.get_device_name(0))
+print("NumPy:", np.__version__)
+PY
+
+WORKDIR /workspace

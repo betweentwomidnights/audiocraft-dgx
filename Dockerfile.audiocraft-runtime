@@ -1,0 +1,211 @@
+# Build on top of your working torch image (torch 2.1.0 CUDA build and now CUDNN!)
+FROM thecollabagepatch/torch-cudnn:latest
+
+ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
+# system libs: audio I/O + build bits + cffi backend for soundfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ffmpeg sox libsndfile1 libsox-dev libsox-fmt-all \
+    python3-cffi build-essential python3-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# === Base Python constraints ===
+ARG NUMPY_PIN=1.26.4
+RUN printf "numpy==%s\n" "$NUMPY_PIN" > /tmp/constraints.txt \
+ && python3 -m pip install -U pip setuptools wheel -c /tmp/constraints.txt
+
+# --- Make sure CUDA libs are easy to find at runtime (for torch + nvrtc) ---
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# --- Torchaudio 2.1.0 built against our torch (avoids CPU-only wheel) ---
+# If the wheel install succeeds, the '||' branch won't run.
+RUN python3 -m pip install --no-cache-dir "torchaudio==2.1.0" -c /tmp/constraints.txt || \
+    (git clone --branch v2.1.0 https://github.com/pytorch/audio.git /tmp/audio && \
+     cd /tmp/audio && \
+     python3 -m pip install -r requirements.txt -c /tmp/constraints.txt && \
+     TORCH_CUDA_ARCH_LIST="9.0+PTX" USE_CUDA=1 CUDA_HOME=/usr/local/cuda \
+       python3 setup.py bdist_wheel && \
+     python3 -m pip install --no-deps --no-cache-dir dist/torchaudio-*.whl -c /tmp/constraints.txt && \
+     cd / && rm -rf /tmp/audio)
+
+# --- Audiocraft (source), install without deps to avoid pulling xformers ---
+RUN git clone https://github.com/facebookresearch/audiocraft.git /opt/audiocraft
+WORKDIR /opt/audiocraft
+# Optionally pin a known-good commit for torch==2.1.0
+# RUN git checkout <commit-or-tag>
+RUN python3 -m pip install -e . --no-deps
+
+# Make pip prefer wheels when available
+ENV PIP_PREFER_BINARY=1
+
+# FFmpeg dev headers for PyAV build fallback
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+    libavfilter-dev libswscale-dev libswresample-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Deps we actually want (pins match what you tested) ---
+# av must match Audiocraft’s expectation (11.0.0)
+# tokenizers 0.22.1 has manylinux aarch64 wheels (0.18.1 was missing on aarch64)
+# Consolidated runtime deps (pins match what we validated)
+RUN printf "%s\n" \
+  "numpy==1.26.4" \
+  "av==11.0.0" \
+  "encodec" \
+  "hydra-core<1.4" "omegaconf<2.4" "antlr4-python3-runtime==4.9.3" \
+  "torchmetrics" "torchdiffeq" "num2words" \
+  "dora-search<0.2" "flashy<0.2" "treetable==0.2.6" "retrying==1.4.2" "submitit==1.5.3" "cloudpickle==3.1.1" "colorlog==6.10.1" \
+  "transformers==4.39.3" "huggingface_hub==0.22.2" "protobuf==4.25.3" "regex==2024.11.6" \
+  "pillow==10.4.0" "absl-py==2.1.0" "grpcio==1.62.1" "markdown==3.5.2" \
+  "tensorboard-data-server==0.7.2" "werkzeug==3.0.3" "lightning-utilities==0.11.7" \
+  "tokenizers==0.15.2" \
+  "spacy==3.7.6" \
+  "librosa<0.11" "lazy-loader==0.3" "llvmlite==0.42.0" "numba==0.59.1" \
+  "joblib==1.4.2" "decorator==5.1.1" "msgpack==1.0.7" "pooch==1.8.2" "audioread==3.0.1" \
+  "pesq" "pystoi" \
+  "demucs" \
+> /tmp/requirements.runtime.txt \
+ && python3 -m pip install -r /tmp/requirements.runtime.txt -c /tmp/constraints.txt
+
+
+# --- xformers → SDPA shim (adds memory_efficient_attention, LowerTriangularMask, unbind) ---
+RUN python3 - <<'PY'
+import pathlib, textwrap, site
+pkgdir = pathlib.Path(site.getsitepackages()[0]) / "xformers"
+pkgdir.mkdir(parents=True, exist_ok=True)
+(pkgdir / "__init__.py").write_text("from .ops import *\n", encoding="utf-8")
+(pkgdir / "ops.py").write_text(textwrap.dedent('''
+import torch
+from torch.nn.functional import scaled_dot_product_attention as _sdpa
+__all__ = ["memory_efficient_attention", "LowerTriangularMask", "unbind"]
+class LowerTriangularMask:
+    def __init__(self, *args, **kwargs): pass
+def unbind(x, dim=0): return torch.unbind(x, dim=dim)
+def memory_efficient_attention(q, k, v, attn_bias=None, p=0.0, scale=None):
+    if scale is None: scale = 1.0 / (q.size(-1) ** 0.5)
+    causal = isinstance(attn_bias, LowerTriangularMask)
+    dropout_p = p if (q.requires_grad and q.is_cuda and q.dtype.is_floating_point) else 0.0
+    return _sdpa(q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal, scale=scale)
+'''), encoding="utf-8")
+print("Installed xformers SDPA shim at", pkgdir / "ops.py")
+PY
+
+# --- Make NVRTC safe on Blackwell and patch trunc_normal_ → CPU at process start ---
+ENV USER=audiocraft \
+    DORA_DIR=/workspace/.dora \
+    HF_HOME=/workspace/.hf \
+    TRANSFORMERS_CACHE=/workspace/.hf \
+    PYTORCH_NVRTC_ARCH_LIST=compute_90 \
+    EFFICIENT_ATTENTION_BACKEND=torch \
+    XFORMERS_DISABLED=1
+
+# Put our sitecustomize/xformers shim location first
+ENV PYTHONPATH=/usr/local/lib/python3.10/dist-packages
+# sitecustomize: patch trunc_normal_ to CPU so NVRTC doesn’t JIT erfinv on GPU
+# --- sitecustomize to avoid NVRTC arch and to patch trunc_normal_ on CPU ---
+RUN python3 - <<'PY'
+import os, sys, textwrap, pathlib
+content = textwrap.dedent("""
+import os, torch
+from torch.nn import init as I
+
+# Ensure CUDA libs are discoverable
+os.environ.setdefault("LD_LIBRARY_PATH", "/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/lib64")
+
+# Avoid NVRTC compiling for unknown Blackwell arch (we built sm_90+PTX)
+os.environ.setdefault("PYTORCH_NVRTC_ARCH_LIST", "compute_90")
+
+# Prefer PyTorch SDPA over xformers
+os.environ.setdefault("EFFICIENT_ATTENTION_BACKEND", "torch")
+os.environ.setdefault("XFORMERS_DISABLED", "1")
+os.environ.setdefault("FLASH_ATTENTION", "0")
+os.environ.setdefault("USE_FLASH_ATTENTION", "0")
+
+# HF caches
+os.environ.setdefault("HF_HOME", "/workspace/.hf")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/workspace/.hf")
+
+# Patch trunc_normal_ to avoid GPU erfinv via NVRTC on first init
+def _trunc_normal_cpu_(tensor, mean=0., std=1., a=-2., b=2.):
+    with torch.no_grad():
+        tmp = torch.empty_like(tensor, device='cpu', dtype=torch.float32)
+        I._no_grad_trunc_normal_(tmp, mean, std, a, b)
+        tensor.copy_(tmp.to(tensor.dtype, non_blocking=True))
+        return tensor
+I.trunc_normal_ = _trunc_normal_cpu_
+""")
+
+targets = [
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/sitecustomize.py"),
+    pathlib.Path("/usr/lib/python3/dist-packages/sitecustomize.py"),
+]
+for t in targets:
+    t.parent.mkdir(parents=True, exist_ok=True)
+    t.write_text(content, encoding="utf-8")
+    print("Wrote", t)
+PY
+
+# Make sure Python sees /usr/local first so sitecustomize triggers
+ENV PYTHONPATH=/usr/local/lib/python3.10/dist-packages:${PYTHONPATH}
+
+
+# --- Re-assert our CUDA torch and (re)build torchaudio against it ---
+# 1) Force-reinstall your locally built CUDA wheel (prevents any CPU re-pin)
+RUN python3 -m pip install --no-deps --force-reinstall /workspace/pytorch/dist/torch-*.whl
+
+# 2) torchaudio built against that exact torch
+RUN python3 -m pip uninstall -y torchaudio || true && \
+    git clone --branch v2.1.0 https://github.com/pytorch/audio.git /tmp/audio && \
+    cd /tmp/audio && \
+    printf "numpy==1.26.4\n" > /tmp/constraints.txt && \
+    python3 -m pip install -r requirements.txt -c /tmp/constraints.txt && \
+    env CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="9.0+PTX" USE_CUDA=1 \
+        python3 setup.py clean && \
+    env CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="9.0+PTX" USE_CUDA=1 \
+        python3 setup.py bdist_wheel && \
+    python3 -m pip install --no-deps --no-cache-dir dist/torchaudio-*.whl -c /tmp/constraints.txt && \
+    cd / && rm -rf /tmp/audio
+
+# Bits we saw missing at runtime
+RUN printf "numpy==1.26.4\n" > /tmp/constraints.txt && \
+    python3 -m pip install -c /tmp/constraints.txt \
+      sentencepiece==0.1.99
+
+# Simple Dora training launcher that mirrors the command you ran
+# Ensure target dir exists
+RUN mkdir -p /usr/local/bin
+
+# Write a small one-shot training helper
+RUN cat > /usr/local/bin/train_example.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Dora/Hydra dirs (don’t expand during build thanks to quoted heredoc)
+: "${DORA_DIR:=/workspace/.dora}"
+export DORA_DIR
+RUN_DIR="/workspace/runs/mg-small-eg-$(date +%F_%H-%M-%S)"
+
+cd /opt/audiocraft
+
+exec dora -P audiocraft --main_module train run -- \
+  hydra.run.dir="${RUN_DIR}" \
+  solver=musicgen/musicgen_base_32khz \
+  model/lm/model_scale=small \
+  continue_from=//pretrained/facebook/musicgen-small \
+  dset=audio/example \
+  conditioner=text2music \
+  dataset.num_workers=1 \
+  dataset.batch_size=1 \
+  dataset.valid.num_samples=1 \
+  optim.epochs=1 \
+  optim.updates_per_epoch=10 \
+  generate.lm.prompted_samples=False \
+  generate.lm.gen_gt_samples=True \
+  efficient_attention_backend=torch
+SH
+
+RUN chmod +x /usr/local/bin/train_example.sh
+
+
+
+WORKDIR /workspace
