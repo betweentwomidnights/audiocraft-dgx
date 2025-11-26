@@ -13,7 +13,7 @@ it will take a long time.
 then you can build the audiocraft runtime on top of this base image. 
 
 ```
-docker build -t thecollabagepatch/audiocraft-runtime:lattest -f Dockerfile.audiocraft-runtime .
+docker build -t thecollabagepatch/audiocraft-runtime:latest -f Dockerfile.audiocraft-runtime .
 ```
 
 it's been almost a month since i built both of these. i can enter the container and run training as well as inference. i really hope this works for you.
